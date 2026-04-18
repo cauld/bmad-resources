@@ -7,23 +7,24 @@
 #
 set -euo pipefail
 
-# ⚠️  SECURITY NOTICE
+# SECURITY MODEL
 #
-# This pipeline runs automated Claude Code sessions with --dangerously-skip-permissions.
-# The agents have access to board tools and auto-accept changes without explicit confirmation.
+# Each step runs `claude -p` with a per-step `--allowedTools` allowlist (fail-closed:
+# tools not on the list are rejected). No step uses `--dangerously-skip-permissions`.
 #
-# STRONGLY RECOMMENDED: Run this script inside a Dev Container or Docker container to
-# isolate it from your host system. This prevents any unintended modifications from
-# affecting your local environment, dependencies, or sensitive files.
+# Reviewer steps (code review, test review) are NOT granted Edit / Task / Agent —
+# a reviewer must not be able to modify production code or spawn subagents that
+# could escape the read-only constraint. This is a security boundary, not an
+# ergonomics choice; do not relax it.
 #
-# Dev Container setup: https://containers.dev/
-# Docker: docker run -it -v $(pwd):/workspace node:20 /bin/bash
+# Bash access is split: a read-only inspection set (git status/diff/log/show, ls,
+# find, date) is always available; DEV_BASH_EXTRA adds build/test commands for
+# dev and fix steps. Override DEV_BASH_EXTRA to add language-specific tools
+# (cargo, go, make, pytest, etc.) for your project.
 #
-# TODO: Spike on replacing --dangerously-skip-permissions with --allowedTools for
-# per-step least-privilege permissions. E.g.:
-#   Steps 1-5: "Read Edit Write Glob Grep Task(Explore)"  (file ops only)
-#   Step 6:    "Read Edit Glob Grep"                      (minimal)
-#   Step 7:    "Read Edit Write Glob Grep Bash(npm run *) Bash(cargo *) Bash(./scripts/*)"
+# Defense-in-depth: container isolation is still recommended so an escaped or
+# misbehaving agent cannot touch the host. See https://containers.dev/ or run:
+#   docker run -it -v $(pwd):/workspace node:20 /bin/bash
 #
 # ────────────────────────────────────────────────────────────────────────────────────
 
@@ -75,8 +76,8 @@ set -euo pipefail
 #            │
 #            ▼
 #   ┌───────────────────┐
-#   │  7. Lint &        │  MODEL_FIX
-#   │     Pre-Release   │  $LINT_CMD, $PRERELEASE_CMD
+#   │  7. Pre-Release   │  MODEL_FIX
+#   │     Checks        │  $PRERELEASE_CMD
 #   └────────┬──────────┘
 #            │
 #            ▼
@@ -154,6 +155,36 @@ MODEL_REVIEW="${MODEL_REVIEW:-opus}"
 MODEL_FIX="${MODEL_FIX:-sonnet}"
 MODEL_SPRINT="${MODEL_SPRINT:-haiku}"
 
+# --- Per-step tool allowlists (least-privilege) ---
+#
+# Passed to `claude -p --allowedTools` per step. Tools not on the list fail closed.
+# Tighten or loosen based on denial patterns in .pipeline-logs/*/step-N.log.
+
+# Safe read-only shell commands (no state mutation)
+_BASH_INSPECT="Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(ls:*),Bash(find:*),Bash(date)"
+
+# Build/test shell commands used during dev and fix steps.
+# Override DEV_BASH_EXTRA to add language-specific tools for your project, e.g.:
+#   DEV_BASH_EXTRA="Bash(cargo:*),Bash(go:*),Bash(pytest:*)"
+DEV_BASH_EXTRA="${DEV_BASH_EXTRA:-Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(./scripts/*),Bash(mkdir:*),Bash(touch:*)}"
+
+# Step 1 (dev) / 3 (fix code review) / 5 (fix test review) / 7 (pre-release):
+# full dev toolkit — file ops + dev bash + subagents + web fetch for docs
+STEP_TOOLS_DEV="Read,Edit,Write,Glob,Grep,TodoWrite,Task,Agent,WebFetch,${DEV_BASH_EXTRA},${_BASH_INSPECT}"
+
+# Step 2 (code review) / 4 (test review):
+# read code + write review file (NO Edit, NO Task/Agent — reviewer cannot modify prod
+# code or spawn subagents that could escape the read-only constraint; this is enforced
+# by the security header above and must not be relaxed).
+STEP_TOOLS_REVIEW="Read,Glob,Grep,Write,TodoWrite,${_BASH_INSPECT}"
+
+# Step 6 (mark done): edits one YAML file — minimal surface. Only used as a fallback
+# when the deterministic sed path can't determine the story key.
+STEP_TOOLS_SPRINT="Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(date)"
+
+# Preflight: just enough to echo a string
+STEP_TOOLS_PREFLIGHT="Read"
+
 # Project-specific configuration (override via env vars)
 # Defaults match BMAD standard directory layout
 STORIES_DIR="${STORIES_DIR:-_bmad-output/implementation-artifacts}"
@@ -168,17 +199,37 @@ WORKFLOW_DEV="${WORKFLOW_DEV:-*dev-story workflow}"
 WORKFLOW_CODE_REVIEW="${WORKFLOW_CODE_REVIEW:-*code-review workflow}"
 WORKFLOW_TEST_REVIEW="${WORKFLOW_TEST_REVIEW:-*testarch-test-review workflow}"
 
-# Final checks (step 7) — set to empty string to skip either
-LINT_CMD="${LINT_CMD:-}"
-#
 # PRERELEASE_CMD: the script that must pass before a story is accepted.
 # It should run ALL checks required for story acceptance: unit tests, integration
 # tests, type-checking, linting, and any other quality gates. The pipeline will
 # keep iterating (fix → re-run) until this command exits 0.
 #
-# Set to empty string to skip step 7 entirely (not recommended for production use).
+# To skip step 7 entirely: unset the variable (not recommended for production use).
+#   unset PRERELEASE_CMD  OR  PRERELEASE_CMD='' is NOT sufficient (:-  falls through to default)
 # If the script does not exist at startup, the pipeline will warn and abort.
 PRERELEASE_CMD="${PRERELEASE_CMD:-./scripts/pre-release-check.sh}"
+
+# --- Tiered gating (epic mode only) ---
+#
+#   fast: after each story, run FAST_GATE_CMD (scoped lightweight check on the
+#         story's diff); every CHECKPOINT_EVERY stories run CHECKPOINT_GATE_CMD
+#         (scoped to the cumulative diff since epic start); run PRERELEASE_CMD
+#         once at epic end as a terminal gate. If FAST_GATE_CMD/CHECKPOINT_GATE_CMD
+#         is empty, that tier falls through to PRERELEASE_CMD.
+#   full: run PRERELEASE_CMD after every story (original behavior).
+#
+# FAST_GATE_CMD and CHECKPOINT_GATE_CMD receive the touched file list via the
+# CHANGED_FILES env var (newline-separated, relative to repo root). Example:
+#   FAST_GATE_CMD='echo "$CHANGED_FILES" | grep -q "\.py$" && pytest -q -x --lf'
+PER_STORY_GATE="${PER_STORY_GATE:-full}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-3}"
+FAST_GATE_CMD="${FAST_GATE_CMD:-}"
+CHECKPOINT_GATE_CMD="${CHECKPOINT_GATE_CMD:-}"
+
+# BMAD_TERSE_PROMPTS=1 adds output-hygiene rules to step prompts, suppressing LLM
+# narration without affecting review artifact quality. Useful for reducing token
+# output in long epic runs.
+BMAD_TERSE_PROMPTS="${BMAD_TERSE_PROMPTS:-0}"
 
 # Options
 STORY_FILE=""
@@ -188,6 +239,8 @@ VERBOSE=false
 QUIET=false
 START_AT=1
 STOP_AT=7
+# Tracks whether gating flags were set via CLI (vs. env-var default)
+_PER_STORY_GATE_SET=false
 
 usage() {
     echo "Usage: $0 [options]"
@@ -195,15 +248,20 @@ usage() {
     echo "Automates the full BMAD dev-story pipeline with model switching."
     echo ""
     echo "Options:"
-    echo "  --story <id|file> Story ID (e.g. 34-4, 34.4) or full path"
-    echo "  --epic [N]        Run all ready-for-dev stories in epic N (auto-detects if omitted)"
-    echo "  --skip-dev        Skip step 1 (story implementation)"
-    echo "  --start-at <N>    Start at step N (1-7)"
-    echo "  --stop-at <N>     Stop after step N (1-7)"
-    echo "  --verbose         Stream tool activity in real time"
-    echo "  --quiet           Show only step headers and progress bar (suppress LLM output)"
-    echo "  --dry-run         Preview commands without executing"
-    echo "  --help            Show this help"
+    echo "  --story <id|file>      Story ID (e.g. 34-4, 34.4) or full path"
+    echo "  --epic [N]             Run all ready-for-dev stories in epic N (auto-detects if omitted)"
+    echo "  --skip-dev             Skip step 1 (story implementation)"
+    echo "  --start-at <N>         Start at step N (1-7)"
+    echo "  --stop-at <N>          Stop after step N (1-7)"
+    echo "  --verbose              Stream tool activity in real time"
+    echo "  --quiet                Show only step headers and progress bar (suppress LLM output)"
+    echo "  --dry-run              Preview commands without executing"
+    echo "  --per-story-gate <fast|full>"
+    echo "                         Epic mode gating strategy (default: full)"
+    echo "                         fast: lightweight check per story + checkpoint every N + terminal gate"
+    echo "                         full: full pre-release after every story (original behavior)"
+    echo "  --checkpoint-every <N> Checkpoint cadence in fast-gate mode (default: 3)"
+    echo "  --help                 Show this help"
     echo ""
     echo "Model overrides (env vars):"
     echo "  MODEL_DEV=$MODEL_DEV  MODEL_REVIEW=$MODEL_REVIEW  MODEL_FIX=$MODEL_FIX  MODEL_SPRINT=$MODEL_SPRINT"
@@ -216,8 +274,13 @@ usage() {
     echo "  WORKFLOW_DEV=$WORKFLOW_DEV"
     echo "  WORKFLOW_CODE_REVIEW=$WORKFLOW_CODE_REVIEW"
     echo "  WORKFLOW_TEST_REVIEW=$WORKFLOW_TEST_REVIEW"
-    echo "  LINT_CMD=${LINT_CMD:-(not set)}"
     echo "  PRERELEASE_CMD=${PRERELEASE_CMD:-(not set)}"
+    echo "  PER_STORY_GATE=$PER_STORY_GATE"
+    echo "  CHECKPOINT_EVERY=$CHECKPOINT_EVERY"
+    echo "  FAST_GATE_CMD=${FAST_GATE_CMD:-(not set)}"
+    echo "  CHECKPOINT_GATE_CMD=${CHECKPOINT_GATE_CMD:-(not set)}"
+    echo "  BMAD_TERSE_PROMPTS=$BMAD_TERSE_PROMPTS"
+    echo "  DEV_BASH_EXTRA=$DEV_BASH_EXTRA"
     exit 0
 }
 
@@ -379,6 +442,31 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --per-story-gate)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo -e "${RED}--per-story-gate requires 'fast' or 'full'${NC}"
+                exit 1
+            fi
+            if [[ "$2" != "fast" && "$2" != "full" ]]; then
+                echo -e "${RED}--per-story-gate must be 'fast' or 'full' (got: $2)${NC}"
+                exit 1
+            fi
+            PER_STORY_GATE="$2"
+            _PER_STORY_GATE_SET=true
+            shift 2
+            ;;
+        --checkpoint-every)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                echo -e "${RED}--checkpoint-every requires a positive integer${NC}"
+                exit 1
+            fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1 ]; then
+                echo -e "${RED}--checkpoint-every must be a positive integer (got: $2)${NC}"
+                exit 1
+            fi
+            CHECKPOINT_EVERY="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             ;;
@@ -404,6 +492,17 @@ fi
 # --story and --epic are mutually exclusive
 if [ -n "$STORY_FILE" ] && [ -n "$EPIC_NUM" ]; then
     echo -e "${RED}--story and --epic are mutually exclusive${NC}"
+    exit 1
+fi
+
+# --per-story-gate only applies in epic mode
+if [[ "$_PER_STORY_GATE_SET" == "true" && -z "$EPIC_NUM" ]]; then
+    echo -e "${YELLOW}  Warning: --per-story-gate is only used in --epic mode (ignored for single-story runs)${NC}"
+fi
+
+# Validate CHECKPOINT_EVERY (after CLI parsing so --checkpoint-every can override env var)
+if ! [[ "$CHECKPOINT_EVERY" =~ ^[0-9]+$ ]] || [ "$CHECKPOINT_EVERY" -lt 1 ]; then
+    echo -e "${RED}CHECKPOINT_EVERY must be a positive integer (got: $CHECKPOINT_EVERY)${NC}" >&2
     exit 1
 fi
 
@@ -439,8 +538,8 @@ fi
 
 # --- Preflight Check ---
 if [ "$DRY_RUN" != true ]; then
-    echo -e "${DIM}  Preflight: testing claude -p --dangerously-skip-permissions ...${NC}"
-    preflight_out=$(claude -p --model haiku --dangerously-skip-permissions "Reply with only: PREFLIGHT_OK" 2>&1) || true
+    echo -e "${DIM}  Preflight: testing claude -p --allowedTools ...${NC}"
+    preflight_out=$(echo "Reply with only: PREFLIGHT_OK" | claude -p --model haiku --allowedTools "$STEP_TOOLS_PREFLIGHT" 2>&1) || true
     if [[ "$preflight_out" == *"PREFLIGHT_OK"* ]]; then
         echo -e "${GREEN}  Preflight passed${NC}"
     else
@@ -501,12 +600,13 @@ step_done() {
 run_claude() {
     local step_num=$1
     local model=$2
-    shift 2
+    local tools=$3
+    shift 3
     local prompt="$*"
     local step_log="$LOG_DIR/step-${step_num}.log"
 
     if [ "$DRY_RUN" = true ]; then
-        echo -e "${YELLOW}  [DRY RUN] claude -p --model $model${NC}"
+        echo -e "${YELLOW}  [DRY RUN] claude -p --model $model --allowedTools \"$tools\"${NC}"
         echo -e "${DIM}  Prompt: ${prompt:0:120}...${NC}"
         return 0
     fi
@@ -550,9 +650,9 @@ run_claude() {
     set +o pipefail
     (
         trap - INT TERM
-        claude -p --model "$model" --dangerously-skip-permissions \
+        claude -p --model "$model" --allowedTools "$tools" \
             --verbose --output-format stream-json --include-partial-messages \
-            "$prompt" 2>"$stderr_log" | \
+            <<<"$prompt" 2>"$stderr_log" | \
         SHOW_TOOLS="$show_tools" SHOW_OUTPUT="$show_output" python3 -u -c "
 import sys, json, os
 
@@ -640,6 +740,165 @@ print()  # final newline
     return 0
 }
 
+# --- Pipeline helpers ---
+
+# Replaces the yaml entry's status word with "done" while preserving inline comments.
+# Expects the full story key as it appears in sprint-status.yaml (e.g. "55-9-my-story").
+# Returns 1 if the change could not be verified — caller should fall back to LLM.
+mark_story_done() {
+    local story_key="${1:?story key required}"
+    local file="$PROJECT_ROOT/$SPRINT_STATUS_FILE"
+
+    [ -f "$file" ] || return 1
+
+    # Escape sed BRE metacharacters in story_key so dots/brackets don't match arbitrarily.
+    local escaped_key
+    escaped_key="$(printf '%s' "$story_key" | sed 's/[.[*^$\\]/\\&/g')"
+
+    # Portable sed: GNU sed uses -i with no suffix; BSD/macOS sed requires -i ''.
+    # Replace the status value on the matching line; stops at first non-[a-z-] char
+    # so trailing inline YAML comments are untouched.
+    if sed --version >/dev/null 2>&1; then
+        sed -i "s/^\([[:space:]]*${escaped_key}:\)[[:space:]]*[a-z-]*/\1 done/" "$file"
+    else
+        sed -i '' "s/^\([[:space:]]*${escaped_key}:\)[[:space:]]*[a-z-]*/\1 done/" "$file"
+    fi
+
+    # Verify sed actually changed the line — fail closed if key not found or not "done".
+    # Use escaped_key in the grep pattern for consistency with the sed expression above.
+    local verify
+    verify=$(grep -E "^[[:space:]]+${escaped_key}:" "$file" | head -1)
+    if ! echo "$verify" | grep -qE ":[[:space:]]*done"; then
+        return 1
+    fi
+}
+
+# Return 0 (true) if an artifact file contains actionable findings; 1 if clean.
+# Fail-closed: missing or empty file is treated as "has findings" so the fix step runs.
+has_findings() {
+    local artifact="${1:?artifact path required}"
+
+    # File missing or empty → findings unknown, fix step must run
+    [[ ! -s "$artifact" ]] && return 0
+
+    # Explicit zero-findings markers (written by review workflows on clean pass)
+    grep -qiE '^## Findings \(0\)' "$artifact" && return 1
+
+    # Common "all clear" phrases the LLM may write
+    grep -qiE '^(no findings|no issues found|✅ clean|all clear)[[:space:]]*$' "$artifact" && return 1
+
+    # Count substantive lines inside any top-level findings/issues/observations section.
+    local body_lines
+    body_lines="$(awk 'tolower($0) ~ /^## (findings|issues|observations)/{flag=1;next}/^## /{flag=0}flag && NF && !/^[[:space:]]*#/{print}' "$artifact" | wc -l | tr -d ' ')"
+    [[ "$body_lines" -gt 0 ]]
+}
+
+# Emit a JSONL record to the gate telemetry log for cadence tuning.
+log_gate_event() {
+    local gate_type="$1"   # fast | checkpoint | terminal
+    local story_key="$2"
+    local outcome="$3"     # pass | fail
+    local elapsed="$4"     # seconds
+
+    local gate_log="$PROJECT_ROOT/.pipeline-logs/gates/$(date +%Y-%m-%d).jsonl"
+    mkdir -p "$(dirname "$gate_log")"
+    # Strip control characters and JSON-significant chars from story_key to prevent JSONL injection.
+    local safe_key
+    safe_key="$(printf '%s' "$story_key" | tr -d '\000-\037"\\' | cut -c1-80)"
+    printf '{"ts":"%s","gate":"%s","story":"%s","outcome":"%s","elapsed":%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$gate_type" "$safe_key" "$outcome" "$elapsed" \
+        >> "$gate_log"
+}
+
+# Run a user-supplied gate command with the touched file list exported as CHANGED_FILES.
+# If the gate command is empty, fall through to PRERELEASE_CMD.
+# If both are empty, treat as pass (nothing to check).
+_run_gate_cmd() {
+    local gate_type="$1"      # fast | checkpoint (for logging)
+    local base_ref="$2"
+    local story_key="$3"
+    local gate_cmd="$4"
+
+    [ "$DRY_RUN" = true ] && { echo -e "${YELLOW}  [DRY RUN] ${gate_type}_gate skipped${NC}"; return 0; }
+    local gate_start=$SECONDS
+
+    echo -e "${CYAN}  [${gate_type}_gate] Computing changed files since $base_ref...${NC}"
+    local changed
+    changed="$(git diff --name-only "$base_ref"...HEAD 2>/dev/null)" || changed=""
+
+    if [[ -z "$changed" ]]; then
+        echo -e "${DIM}  [${gate_type}_gate] No changes detected — skipping${NC}"
+        log_gate_event "$gate_type" "$story_key" "pass" "0"
+        return 0
+    fi
+
+    local rc=0
+    # tr-based uppercase for bash 3.x portability (${var^^} requires bash 4.0+)
+    local gate_type_upper
+    gate_type_upper="$(echo "$gate_type" | tr '[:lower:]' '[:upper:]')"
+    if [[ -n "$gate_cmd" ]]; then
+        echo -e "${CYAN}  [${gate_type}_gate] Running: $gate_cmd${NC}"
+        ( cd "$PROJECT_ROOT" && CHANGED_FILES="$changed" eval "$gate_cmd" ) 2>&1 || rc=$?
+    elif [[ -n "$PRERELEASE_CMD" ]]; then
+        echo -e "${YELLOW}  [${gate_type}_gate] ${gate_type_upper}_GATE_CMD empty — running PRERELEASE_CMD${NC}"
+        ( cd "$PROJECT_ROOT" && CHANGED_FILES="$changed" eval "$PRERELEASE_CMD" ) 2>&1 || rc=$?
+    else
+        echo -e "${YELLOW}  [${gate_type}_gate] No gate command and no PRERELEASE_CMD — treating as pass${NC}"
+    fi
+
+    local elapsed=$(( SECONDS - gate_start ))
+    local outcome; [[ $rc -eq 0 ]] && outcome="pass" || outcome="fail"
+    log_gate_event "$gate_type" "$story_key" "$outcome" "$elapsed"
+
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${RED}  [${gate_type}_gate] FAILED (exit $rc, ${elapsed}s)${NC}"
+    else
+        echo -e "${GREEN}  [${gate_type}_gate] PASSED (${elapsed}s)${NC}"
+    fi
+    return $rc
+}
+
+# Fast per-story gate: scoped to the single story's diff.
+fast_gate() {
+    local base_ref="${1:?base ref required}"
+    local story_key="${2:-unknown}"
+    _run_gate_cmd "fast" "$base_ref" "$story_key" "$FAST_GATE_CMD"
+}
+
+# Checkpoint gate: scoped to cumulative diff since epic start.
+checkpoint_gate() {
+    local epic_base_ref="${1:?epic base ref required}"
+    local story_key="${2:-unknown}"
+    _run_gate_cmd "checkpoint" "$epic_base_ref" "$story_key" "$CHECKPOINT_GATE_CMD"
+}
+
+# Terminal gate: thin wrapper around the full pre-release check.
+# Always runs once at the end of an epic in fast-gate mode.
+epic_terminal_gate() {
+    [ "$DRY_RUN" = true ] && { echo -e "${YELLOW}  [DRY RUN] terminal_gate skipped${NC}"; return 0; }
+    # Hard fail rather than silently skip — an empty PRERELEASE_CMD in fast-gate mode
+    # means the epic completed with no full validation, which is a correctness hole.
+    if [[ -z "$PRERELEASE_CMD" ]]; then
+        echo -e "${RED}  [terminal_gate] FATAL: PRERELEASE_CMD is empty — cannot validate epic.${NC}" >&2
+        echo -e "${RED}  Set PRERELEASE_CMD, or switch to --per-story-gate full.${NC}" >&2
+        return 1
+    fi
+    echo -e "${BLUE}  [terminal_gate] Running full pre-release check...${NC}"
+    local gate_start=$SECONDS
+    local rc=0
+    ( cd "$PROJECT_ROOT" && eval "$PRERELEASE_CMD" ) 2>&1 || rc=$?
+
+    local elapsed=$(( SECONDS - gate_start ))
+    log_gate_event "terminal" "epic-end" "$([ $rc -eq 0 ] && echo pass || echo fail)" "$elapsed"
+
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${RED}  [terminal_gate] FAILED (exit $rc, ${elapsed}s)${NC}"
+    else
+        echo -e "${GREEN}  [terminal_gate] PASSED (${elapsed}s)${NC}"
+    fi
+    return $rc
+}
+
 # --- Pipeline ---
 
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -672,8 +931,26 @@ run_story_pipeline() {
     fi
 
     STORY_CONTEXT=""
+    STORY_KEY=""
+    CODE_REVIEW_FILE=""
+    STORY_TEST_REVIEW_FILE=""
     if [ -n "$STORY_FILE" ]; then
         STORY_CONTEXT=" for the story at $STORY_FILE"
+        STORY_KEY="$(basename "$STORY_FILE" .md)"
+        CODE_REVIEW_FILE="$CODE_REVIEW_DIR/${STORY_KEY}-code-review.md"
+        STORY_TEST_REVIEW_FILE="$CODE_REVIEW_DIR/${STORY_KEY}-test-review.md"
+    fi
+
+    # Ensure the review artifact directory exists before steps 2 and 4 write to it.
+    mkdir -p "$PROJECT_ROOT/$CODE_REVIEW_DIR"
+
+    # Prompt tightening: prepend output-hygiene rules when BMAD_TERSE_PROMPTS=1.
+    # These suppress LLM narration without degrading review artifact content.
+    _TERSE=""
+    if [ "$BMAD_TERSE_PROMPTS" = "1" ]; then
+        _TERSE='Output rules: No preamble, no recap, no "I will now" narration. No end summary unless the step asks for one. Bullets over prose. Do not restate file paths or IDs already in this prompt. No congratulatory closers.
+
+'
     fi
 
     # Account for skipped steps in progress tracking
@@ -684,8 +961,8 @@ run_story_pipeline() {
         step_header 1 "$MODEL_DEV" "Implement Story"
         # Touch sentinel now so we can detect which story file was created/modified
         touch "$TMPDIR_PIPELINE/story-detection-sentinel"
-        run_claude 1 "$MODEL_DEV" \
-            "Run the BMAD $WORKFLOW_DEV${STORY_CONTEXT}. Implement all tasks and subtasks, write tests, and update the story file per acceptance criteria."
+        run_claude 1 "$MODEL_DEV" "$STEP_TOOLS_DEV" \
+            "${_TERSE}Run the BMAD $WORKFLOW_DEV${STORY_CONTEXT}. Implement all tasks and subtasks, write tests, and update the story file per acceptance criteria."
         # If no story was specified upfront, detect which story step 1 worked on
         if [ -z "$STORY_FILE" ] && [ "$DRY_RUN" != true ]; then
             detected_story=$(find "$PROJECT_ROOT/$STORIES_DIR" -maxdepth 1 -name "*.md" \
@@ -694,6 +971,9 @@ run_story_pipeline() {
             if [ -n "$detected_story" ]; then
                 STORY_FILE="${detected_story#"$PROJECT_ROOT/"}"
                 STORY_CONTEXT=" for the story at $STORY_FILE"
+                STORY_KEY="$(basename "$STORY_FILE" .md)"
+                CODE_REVIEW_FILE="$CODE_REVIEW_DIR/${STORY_KEY}-code-review.md"
+                STORY_TEST_REVIEW_FILE="$CODE_REVIEW_DIR/${STORY_KEY}-test-review.md"
                 echo -e "  ${GREEN}Auto-detected story: ${CYAN}$STORY_FILE${NC}"
             else
                 echo -e "${RED}  Could not auto-detect which story step 1 worked on.${NC}"
@@ -707,67 +987,86 @@ run_story_pipeline() {
     # Step 2: Code review
     if [ "$START_AT" -le 2 ] && [ "$STOP_AT" -ge 2 ]; then
         step_header 2 "$MODEL_REVIEW" "Code Review"
-        run_claude 2 "$MODEL_REVIEW" \
-            "Run the BMAD $WORKFLOW_CODE_REVIEW${STORY_CONTEXT}. Perform a thorough adversarial code review. Save the review findings to a markdown file in $CODE_REVIEW_DIR/."
+        local _cr_target="${CODE_REVIEW_FILE:-$CODE_REVIEW_DIR/code-review.md}"
+        run_claude 2 "$MODEL_REVIEW" "$STEP_TOOLS_REVIEW" \
+            "${_TERSE}Run the BMAD $WORKFLOW_CODE_REVIEW${STORY_CONTEXT}. Perform a thorough adversarial code review. Save the review findings to $_cr_target."
         step_done 2 "Code Review"
     fi
 
-    # Step 3: Address code review findings
+    # Step 3: Address code review findings (skipped if step 2 produced no findings)
     if [ "$START_AT" -le 3 ] && [ "$STOP_AT" -ge 3 ]; then
-        step_header 3 "$MODEL_FIX" "Address Code Review Findings"
-        run_claude 3 "$MODEL_FIX" \
-            "Look at the most recent code review file in $CODE_REVIEW_DIR/ (the one ending in code-review.md). Address ALL findings: critical, high, medium, and low severity items. Implement any recommended enhancements. After making fixes, update the review doc to mark items as resolved."
-        step_done 3 "Address Code Review Findings"
+        local _cr_file="${CODE_REVIEW_FILE:-$CODE_REVIEW_DIR/code-review.md}"
+        if has_findings "$PROJECT_ROOT/$_cr_file"; then
+            step_header 3 "$MODEL_FIX" "Address Code Review Findings"
+            run_claude 3 "$MODEL_FIX" "$STEP_TOOLS_DEV" \
+                "${_TERSE}Read the code review at $_cr_file. Address ALL findings: critical, high, medium, and low severity items. Implement any recommended enhancements. After making fixes, update the review doc to mark items as resolved."
+            step_done 3 "Address Code Review Findings"
+        else
+            echo -e "${GREEN}  Step 3 skipped — code review has no findings${NC}"
+            ((COMPLETED_STEPS++))
+        fi
     fi
 
     # Step 4: Test review
     if [ "$START_AT" -le 4 ] && [ "$STOP_AT" -ge 4 ]; then
         step_header 4 "$MODEL_REVIEW" "Test Review"
-        run_claude 4 "$MODEL_REVIEW" \
-            "Run the BMAD $WORKFLOW_TEST_REVIEW${STORY_CONTEXT}. Perform a thorough test quality review. The review output goes to $TEST_REVIEW_FILE."
+        local _tr_target="${STORY_TEST_REVIEW_FILE:-$TEST_REVIEW_FILE}"
+        run_claude 4 "$MODEL_REVIEW" "$STEP_TOOLS_REVIEW" \
+            "${_TERSE}Run the BMAD $WORKFLOW_TEST_REVIEW${STORY_CONTEXT}. Perform a thorough test quality review. Save the review output to $_tr_target."
         step_done 4 "Test Review"
     fi
 
-    # Step 5: Address test review findings
+    # Step 5: Address test review findings (skipped if step 4 produced no findings)
     if [ "$START_AT" -le 5 ] && [ "$STOP_AT" -ge 5 ]; then
-        step_header 5 "$MODEL_FIX" "Address Test Review Findings"
-        run_claude 5 "$MODEL_FIX" \
-            "Read the test review at $TEST_REVIEW_FILE. Address ALL findings: critical, high, medium, and low severity items. Implement any recommended enhancements. Fix any test quality issues identified."
-        step_done 5 "Address Test Review Findings"
+        local _tr_file="${STORY_TEST_REVIEW_FILE:-$TEST_REVIEW_FILE}"
+        if has_findings "$PROJECT_ROOT/$_tr_file"; then
+            step_header 5 "$MODEL_FIX" "Address Test Review Findings"
+            run_claude 5 "$MODEL_FIX" "$STEP_TOOLS_DEV" \
+                "${_TERSE}Read the test review at $_tr_file. Address ALL findings: critical, high, medium, and low severity items. Implement any recommended enhancements. Fix any test quality issues identified."
+            step_done 5 "Address Test Review Findings"
+        else
+            echo -e "${GREEN}  Step 5 skipped — test review has no findings${NC}"
+            ((COMPLETED_STEPS++))
+        fi
     fi
 
-    # Step 6: Mark story as done in sprint status
+    # Step 6: Mark story as done in sprint status — deterministic sed, LLM fallback
     if [ "$START_AT" -le 6 ] && [ "$STOP_AT" -ge 6 ]; then
-        step_header 6 "$MODEL_SPRINT" "Mark Story Done"
-        run_claude 6 "$MODEL_SPRINT" \
-            "Mark the current story as done in $SPRINT_STATUS_FILE. Find the story that was just implemented${STORY_CONTEXT} and update its status to 'done'. If there is a completed date field, set it to today's date."
+        step_header 6 "shell/sed" "Mark Story Done"
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "${YELLOW}  [DRY RUN] sed: $SPRINT_STATUS_FILE — ${STORY_KEY:-<unknown>} → done${NC}"
+        elif [ -n "$STORY_KEY" ] && mark_story_done "$STORY_KEY" 2>/dev/null; then
+            echo -e "${DIM}  Updated $SPRINT_STATUS_FILE: $STORY_KEY → done${NC}"
+        else
+            # Fallback: key unknown, sed failed, or verification failed — defer to LLM
+            echo -e "${YELLOW}  Deterministic update failed (key='${STORY_KEY:-<unknown>}') — falling back to LLM${NC}"
+            run_claude 6 "$MODEL_SPRINT" "$STEP_TOOLS_SPRINT" \
+                "Mark the current story as done in $SPRINT_STATUS_FILE. Find the story that was just implemented${STORY_CONTEXT} and update its status to 'done'. If there is a completed date field, set it to today's date."
+        fi
         step_done 6 "Mark Story Done"
     fi
 
-    # Step 7: Lint + pre-release checks (skipped if neither LINT_CMD nor PRERELEASE_CMD is set)
-    if [ "$START_AT" -le 7 ] && [ "$STOP_AT" -ge 7 ] && { [ -n "$LINT_CMD" ] || [ -n "$PRERELEASE_CMD" ]; }; then
-        step_header 7 "$MODEL_FIX" "Lint & Pre-Release Checks"
-        STEP7_PROMPT="Perform final quality checks:"
-        _step_num=1
-        if [ -n "$LINT_CMD" ]; then
-            STEP7_PROMPT+="
-$_step_num. Run the lint command: $LINT_CMD. Fix any issues reported."
-            _step_num=$(( _step_num + 1 ))
-        fi
-        if [ -n "$PRERELEASE_CMD" ]; then
-            STEP7_PROMPT+="
-$_step_num. Run: $PRERELEASE_CMD. Fix any warnings, errors, or test failures. Keep iterating until all checks pass."
-        fi
-        run_claude 7 "$MODEL_FIX" "$STEP7_PROMPT"
-        step_done 7 "Lint & Pre-Release Checks"
+    # Step 7: Pre-release checks.
+    # In epic fast-gate mode this step is skipped per-story (gating handled by fast_gate/
+    # checkpoint_gate in the epic loop, with a terminal gate at the end).
+    # In single-story mode (or full-gate epic mode) this runs the full pre-release script.
+    if [ "$START_AT" -le 7 ] && [ "$STOP_AT" -ge 7 ] && [ -n "$PRERELEASE_CMD" ]; then
+        step_header 7 "$MODEL_FIX" "Pre-Release Checks"
+        run_claude 7 "$MODEL_FIX" "$STEP_TOOLS_DEV" \
+            "${_TERSE}Run: $PRERELEASE_CMD. Fix any warnings, errors, or test failures. Keep iterating until all checks pass."
+        step_done 7 "Pre-Release Checks"
     fi
 }
 
 # --- Execute: single story or epic loop ---
 
 if [ -n "$EPIC_NUM" ]; then
-    # Epic mode: loop through all ready-for-dev stories in the epic
+    # Epic mode: loop through all ready-for-dev stories in the epic.
     EPIC_STORIES_COMPLETED=0
+
+    # Capture the git ref at epic start so checkpoint_gate can diff against the
+    # full epic's changes when needed.
+    epic_base_ref="$(git rev-parse HEAD 2>/dev/null || echo "HEAD")"
 
     while true; do
         next_story_key=$(find_next_story_in_epic "$EPIC_NUM")
@@ -792,15 +1091,54 @@ if [ -n "$EPIC_NUM" ]; then
         STORY_FILE=$(resolve_story "$next_story_key")
         echo -e "  Story file: ${CYAN}$STORY_FILE${NC}"
 
-        run_story_pipeline
+        # Capture git HEAD before story implementation so fast_gate can diff
+        # only this story's changes (not the entire epic's accumulated diff).
+        story_base_ref="$(git rev-parse HEAD 2>/dev/null || echo "HEAD")"
+
+        # In fast-gate mode, skip step 7 per-story (gating handled by fast_gate /
+        # checkpoint_gate below). Run the pipeline in a subshell with PRERELEASE_CMD=""
+        # so step 7 is suppressed without mutating the parent shell's variable.
+        if [[ "$PER_STORY_GATE" == "fast" ]]; then
+            ( export PRERELEASE_CMD=""; run_story_pipeline ) || exit 1
+        else
+            run_story_pipeline
+        fi
+
+        if [[ "$PER_STORY_GATE" == "fast" ]]; then
+            # Fast gate: scope check to this story's diff only.
+            fast_gate "$story_base_ref" "$next_story_key" || {
+                echo -e "${RED}  fast_gate failed for $next_story_key — pipeline stopped.${NC}"
+                exit 1
+            }
+
+            # Checkpoint gate every N stories (scoped to cumulative epic diff).
+            if (( EPIC_STORIES_COMPLETED % CHECKPOINT_EVERY == 0 )); then
+                echo -e "${CYAN}  [checkpoint] Story ${EPIC_STORIES_COMPLETED} — running checkpoint gate...${NC}"
+                checkpoint_gate "$epic_base_ref" "$next_story_key" || {
+                    echo -e "${RED}  checkpoint_gate failed after story ${EPIC_STORIES_COMPLETED} — pipeline stopped.${NC}"
+                    exit 1
+                }
+            fi
+        fi
 
         # Reset for next iteration
         STORY_FILE=""
         echo ""
         echo -e "${GREEN}  Story $next_story_key complete ($EPIC_STORIES_COMPLETED done so far)${NC}"
     done
+
+    # Terminal gate: in fast-gate mode always run the full pre-release check at epic end.
+    # In full mode the per-story step 7 already ran it after the last story.
+    if [[ "$PER_STORY_GATE" == "fast" ]]; then
+        echo ""
+        echo -e "${BLUE}  Epic $EPIC_NUM: all stories done — running terminal gate...${NC}"
+        epic_terminal_gate || {
+            echo -e "${RED}  Terminal gate FAILED — stories are done but full checks did not pass.${NC}"
+            exit 1
+        }
+    fi
 else
-    # Single story mode (original behavior)
+    # Single story mode (original behavior — always runs full pre-release via step 7)
     run_story_pipeline
 fi
 
