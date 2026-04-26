@@ -1053,7 +1053,7 @@ run_story_pipeline() {
     if [ "$START_AT" -le 7 ] && [ "$STOP_AT" -ge 7 ] && [ -n "$PRERELEASE_CMD" ]; then
         step_header 7 "$MODEL_FIX" "Pre-Release Checks"
         run_claude 7 "$MODEL_FIX" "$STEP_TOOLS_DEV" \
-            "${_TERSE}Run: $PRERELEASE_CMD. Fix any warnings, errors, or test failures. Keep iterating until all checks pass."
+            "${_TERSE}Run: $PRERELEASE_CMD synchronously (do NOT use tail -f or any other follow command — those never exit and will hang the session). If you background the script with run_in_background, monitor it via BashOutput polling, not tail. Fix any warnings, errors, or test failures. Keep iterating until all checks pass."
         step_done 7 "Pre-Release Checks"
     fi
 }
