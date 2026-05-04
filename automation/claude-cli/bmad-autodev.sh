@@ -593,7 +593,7 @@ step_header() {
 step_done() {
     local step_num=$1
     local description=$2
-    ((COMPLETED_STEPS++))
+    COMPLETED_STEPS=$((COMPLETED_STEPS + 1))
     echo -e "${GREEN}  ✓ Step $step_num/$TOTAL_STEPS complete: $description${NC}"
 }
 
@@ -1003,7 +1003,7 @@ run_story_pipeline() {
             step_done 3 "Address Code Review Findings"
         else
             echo -e "${GREEN}  Step 3 skipped — code review has no findings${NC}"
-            ((COMPLETED_STEPS++))
+            COMPLETED_STEPS=$((COMPLETED_STEPS + 1))
         fi
     fi
 
@@ -1026,7 +1026,7 @@ run_story_pipeline() {
             step_done 5 "Address Test Review Findings"
         else
             echo -e "${GREEN}  Step 5 skipped — test review has no findings${NC}"
-            ((COMPLETED_STEPS++))
+            COMPLETED_STEPS=$((COMPLETED_STEPS + 1))
         fi
     fi
 
@@ -1081,7 +1081,7 @@ if [ -n "$EPIC_NUM" ]; then
             fi
         fi
 
-        ((EPIC_STORIES_COMPLETED++))
+        EPIC_STORIES_COMPLETED=$((EPIC_STORIES_COMPLETED + 1))
         echo ""
         echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
         echo -e "${BLUE}║  Epic $EPIC_NUM — Story $EPIC_STORIES_COMPLETED: ${next_story_key}${NC}"
