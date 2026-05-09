@@ -103,6 +103,12 @@ set -euo pipefail
 #   MODEL_FIX=sonnet       Model for addressing findings & fixes (default: sonnet)
 #   MODEL_SPRINT=haiku     Model for sprint status updates (default: haiku)
 #
+# Local-LLM mode (environment variable):
+#   BMAD_LITE=1            Drop Task/Agent/WebFetch from the dev toolkit, force terse
+#                          prompts, and skip partial-message streaming. Use when
+#                          MODEL_DEV is a local/quantized model (qwen, llama, mistral,
+#                          etc.) where preamble bloat erodes effective attention.
+#
 # Examples:
 #   ./scripts/bmad-autodev.sh --story 34.4
 #   ./scripts/bmad-autodev.sh --story 35-1
@@ -155,6 +161,23 @@ MODEL_REVIEW="${MODEL_REVIEW:-opus}"
 MODEL_FIX="${MODEL_FIX:-sonnet}"
 MODEL_SPRINT="${MODEL_SPRINT:-haiku}"
 
+# 429 rate-limit retry policy. Anthropic input-tokens-per-minute caps trip late in
+# long steps when conversation transcripts grow large; one minute of patience usually
+# clears the bucket. MAX_429_RETRIES=0 disables retries (original behavior).
+MAX_429_RETRIES="${MAX_429_RETRIES:-2}"
+RATE_LIMIT_SLEEP_SECS="${RATE_LIMIT_SLEEP_SECS:-65}"
+
+# BMAD_LITE=1 enables a bundle of context-discipline changes for local / quantized
+# LLMs (qwen-coder, llama, mistral, etc.) where every kilobyte of preamble erodes
+# the model's effective attention window:
+#   - drops Task, Agent, WebFetch from the dev/fix toolkit so the model can't spawn
+#     subagents (which re-pay the full system+tools+skills cost in a child session)
+#     or fetch web docs it usually doesn't need
+#   - forces BMAD_TERSE_PROMPTS=1 (suppresses LLM narration)
+#   - drops --include-partial-messages from claude invocations (less streaming overhead)
+# Default off, so frontier-model runs (Sonnet/Opus) are unchanged.
+BMAD_LITE="${BMAD_LITE:-0}"
+
 # --- Per-step tool allowlists (least-privilege) ---
 #
 # Passed to `claude -p --allowedTools` per step. Tools not on the list fail closed.
@@ -169,8 +192,13 @@ _BASH_INSPECT="Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show
 DEV_BASH_EXTRA="${DEV_BASH_EXTRA:-Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(./scripts/*),Bash(mkdir:*),Bash(touch:*)}"
 
 # Step 1 (dev) / 3 (fix code review) / 5 (fix test review) / 7 (pre-release):
-# full dev toolkit — file ops + dev bash + subagents + web fetch for docs
-STEP_TOOLS_DEV="Read,Edit,Write,Glob,Grep,TodoWrite,Task,Agent,WebFetch,${DEV_BASH_EXTRA},${_BASH_INSPECT}"
+# full dev toolkit — file ops + dev bash + (optionally) subagents + web fetch for docs.
+# BMAD_LITE=1 strips Task/Agent/WebFetch — see header comment for rationale.
+if [ "$BMAD_LITE" = "1" ]; then
+    STEP_TOOLS_DEV="Read,Edit,Write,Glob,Grep,TodoWrite,${DEV_BASH_EXTRA},${_BASH_INSPECT}"
+else
+    STEP_TOOLS_DEV="Read,Edit,Write,Glob,Grep,TodoWrite,Task,Agent,WebFetch,${DEV_BASH_EXTRA},${_BASH_INSPECT}"
+fi
 
 # Step 2 (code review) / 4 (test review):
 # read code + write review file (NO Edit, NO Task/Agent — reviewer cannot modify prod
@@ -228,8 +256,11 @@ CHECKPOINT_GATE_CMD="${CHECKPOINT_GATE_CMD:-}"
 
 # BMAD_TERSE_PROMPTS=1 adds output-hygiene rules to step prompts, suppressing LLM
 # narration without affecting review artifact quality. Useful for reducing token
-# output in long epic runs.
+# output in long epic runs. BMAD_LITE=1 forces this on (see top of file).
 BMAD_TERSE_PROMPTS="${BMAD_TERSE_PROMPTS:-0}"
+if [ "$BMAD_LITE" = "1" ]; then
+    BMAD_TERSE_PROMPTS=1
+fi
 
 # Options
 STORY_FILE=""
@@ -280,6 +311,7 @@ usage() {
     echo "  FAST_GATE_CMD=${FAST_GATE_CMD:-(not set)}"
     echo "  CHECKPOINT_GATE_CMD=${CHECKPOINT_GATE_CMD:-(not set)}"
     echo "  BMAD_TERSE_PROMPTS=$BMAD_TERSE_PROMPTS"
+    echo "  BMAD_LITE=$BMAD_LITE  (1 = local-LLM mode: strip subagents/web, force terse, no partial streaming)"
     echo "  DEV_BASH_EXTRA=$DEV_BASH_EXTRA"
     exit 0
 }
@@ -597,6 +629,16 @@ step_done() {
     echo -e "${GREEN}  ✓ Step $step_num/$TOTAL_STEPS complete: $description${NC}"
 }
 
+# Detect Anthropic 429 rate-limit signatures in the step's stdout/stderr logs.
+# Matches both the CLI surface ("Request rejected (429)") and the API body
+# ("exceed your organization.s rate limit") so we catch the error wherever it lands.
+_is_rate_limited() {
+    local step_log="$1"
+    local stderr_log="$2"
+    grep -qE 'Request rejected \(429\)|exceed your organization.s rate limit' \
+        "$step_log" "$stderr_log" 2>/dev/null
+}
+
 run_claude() {
     local step_num=$1
     local model=$2
@@ -633,8 +675,26 @@ run_claude() {
     }
     trap local_interrupt INT TERM
 
-    echo -e "${CYAN}  Running: claude -p --model $model ...${NC}"
-    echo ""
+    # Retry loop around the claude invocation. On a detected 429 rate-limit error
+    # we sleep $RATE_LIMIT_SLEEP_SECS (per-minute window) and try again, up to
+    # $MAX_429_RETRIES additional attempts. Previous attempts' logs are preserved
+    # as ${step_log}.attempt-N so they remain inspectable after a successful retry.
+    local attempt=0
+    while : ; do
+        attempt=$((attempt + 1))
+
+        # Preserve prior attempt's logs before re-running
+        if [ "$attempt" -gt 1 ]; then
+            mv "$step_log" "${step_log}.attempt-$((attempt-1))" 2>/dev/null || true
+            mv "$stderr_log" "${stderr_log}.attempt-$((attempt-1))" 2>/dev/null || true
+        fi
+
+        if [ "$attempt" -eq 1 ]; then
+            echo -e "${CYAN}  Running: claude -p --model $model ...${NC}"
+        else
+            echo -e "${CYAN}  Running (attempt $attempt of $((MAX_429_RETRIES + 1))): claude -p --model $model ...${NC}"
+        fi
+        echo ""
 
     # Run the pipeline in a background subshell so that 'wait' (a bash builtin)
     # is used instead of a foreground command.  This is critical: bash traps fire
@@ -647,11 +707,16 @@ run_claude() {
     #
     # We write PIPESTATUS[0] (claude's exit code) to a temp file because
     # PIPESTATUS is not available across the process boundary.
+    # BMAD_LITE drops --include-partial-messages to reduce streaming overhead;
+    # local models still produce complete assistant blocks via the stream-json events.
+    local _partial_flag="--include-partial-messages"
+    [ "$BMAD_LITE" = "1" ] && _partial_flag=""
+
     set +o pipefail
     (
         trap - INT TERM
         claude -p --model "$model" --allowedTools "$tools" \
-            --verbose --output-format stream-json --include-partial-messages \
+            --verbose --output-format stream-json $_partial_flag \
             <<<"$prompt" 2>"$stderr_log" | \
         SHOW_TOOLS="$show_tools" SHOW_OUTPUT="$show_output" python3 -u -c "
 import sys, json, os
@@ -712,7 +777,7 @@ print()  # final newline
     # 'wait' returns immediately when the INT trap fires (unlike foreground cmds)
     wait "$pipeline_pid" || true
 
-    # Restore the outer trap now that the pipeline has finished
+    # Restore the outer trap so Ctrl+C during the retry sleep aborts cleanly
     trap on_interrupt INT TERM
 
     exit_code=$(cat "$exit_code_file" 2>/dev/null || echo "1")
@@ -727,7 +792,25 @@ print()  # final newline
         cat "$stderr_log"
     fi
 
+        # Retry on detected 429 rate limit if budget remains. Stays in the loop;
+        # otherwise breaks out and falls through to the user-prompt fallback below.
+        if [ "$exit_code" -ne 0 ] \
+            && _is_rate_limited "$step_log" "$stderr_log" \
+            && [ "$attempt" -le "$MAX_429_RETRIES" ]; then
+            local retries_left=$(( MAX_429_RETRIES - attempt + 1 ))
+            echo -e "${YELLOW}  ⚠ Rate limit (429) detected. Pausing ${RATE_LIMIT_SLEEP_SECS}s before retry ($retries_left left)...${NC}"
+            sleep "$RATE_LIMIT_SLEEP_SECS"
+            # Re-arm the local interrupt for the next attempt's subshell
+            trap local_interrupt INT TERM
+            continue
+        fi
+        break
+    done
+
     if [ $exit_code -ne 0 ]; then
+        if _is_rate_limited "$step_log" "$stderr_log"; then
+            echo -e "${RED}  Still rate-limited after $attempt attempt(s) (MAX_429_RETRIES=$MAX_429_RETRIES).${NC}"
+        fi
         echo -e "${RED}  Claude exited with code $exit_code${NC}"
         echo -e "${YELLOW}  Continue to next step? [y/N]${NC}"
         read -r answer
@@ -909,6 +992,11 @@ echo -e "  Models: dev=${CYAN}$MODEL_DEV${NC}  review=${CYAN}$MODEL_REVIEW${NC} 
 echo -e "  Steps: ${CYAN}$START_AT${NC} → ${CYAN}$STOP_AT${NC} (of $TOTAL_STEPS)"
 if [ -n "$EPIC_NUM" ]; then
     echo -e "  Mode: ${CYAN}EPIC $EPIC_NUM${NC} — running all ready-for-dev stories sequentially"
+fi
+if [ "$BMAD_LITE" = "1" ]; then
+    echo -e "  ${CYAN}LITE MODE${NC} — subagents/web disabled, terse prompts forced (for local LLMs)"
+elif [[ "$MODEL_DEV" =~ (qwen|llama|mistral|ollama|phi|gemma|local) ]]; then
+    echo -e "  ${YELLOW}Note: MODEL_DEV='$MODEL_DEV' looks like a local model. Consider BMAD_LITE=1 for context discipline.${NC}"
 fi
 if [ "$VERBOSE" = true ]; then
     echo -e "  ${CYAN}VERBOSE MODE — streaming tool activity${NC}"
